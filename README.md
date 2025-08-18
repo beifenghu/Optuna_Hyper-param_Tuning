@@ -1,6 +1,6 @@
 # Optuna Hyper-parameter Tuning for Ultralytics YOLO
 
-![Optuna Logo](C://Users//Administrator//Desktop\111.png)  <!-- 替换为你的图片路径或URL -->
+![Optuna Logo](C://Users//Administrator//Desktop//111.png)  <!-- 替换为你的图片路径或URL -->
 
 ## 项目简介
 基于 Optuna 的自动超参数调整方案，适用于 Ultralytics YOLO 模型的小规模快速验证。通过设置搜索空间和评估指标权重，自动寻找最优超参数组合。
