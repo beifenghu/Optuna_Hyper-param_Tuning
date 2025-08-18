@@ -20,9 +20,9 @@
 
 ## 安装依赖
 
-pip install optuna 
-pip install ultralytics  # 官方文档: https://github.com/ultralytics/ultralytics
-pip install -r requirements.txt  # 包含 PyTorch 和 CUDA 依赖
+- pip install optuna 
+- pip install ultralytics  # 官方文档: https://github.com/ultralytics/ultralytics
+- pip install -r requirements.txt  # 包含 PyTorch 和 CUDA 依赖
 
 ---
 
