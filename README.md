@@ -10,7 +10,7 @@ pip install requirement.txt(pytorch框架、python3.10.18、cuda12.6、Nvidia Dr
 
 运行:
 设置好程序中
-1.data_yaml-----你的数据集路径
+1.data_yaml-----你的数据集路径\n
 2.base_model----你的模型路径
 3.trials-------寻找参数最优组合试验的次数
 4.epochs_per_trial-------每个试验训练的epoch数
