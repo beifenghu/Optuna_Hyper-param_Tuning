@@ -1,6 +1,6 @@
 # Optuna Hyper-parameter Tuning for Ultralytics YOLO
 
-![Optuna Logo](https://github.com/beifenghu/Optuna_Hyper-param_Tuning/blob/main/111.png)  <!-- 替换为你的图片路径或URL -->
+![Optuna Logo](C://Users//Administrator//Desktop/111.png)  <!-- 替换为你的图片路径或URL -->
 
 ## 项目简介
 基于 Optuna 的自动超参数调整方案，适用于 Ultralytics YOLO 模型的小规模快速验证。通过设置搜索空间和评估指标权重，自动寻找最优超参数组合。
@@ -19,8 +19,8 @@
 ---
 
 ## 安装依赖
-```bash
-pip install optuna
+
+pip install optuna 
 pip install ultralytics  # 官方文档: https://github.com/ultralytics/ultralytics
 pip install -r requirements.txt  # 包含 PyTorch 和 CUDA 依赖
 
@@ -42,6 +42,5 @@ pip install -r requirements.txt  # 包含 PyTorch 和 CUDA 依赖
 - TPESampler 的 n_startup_trials 和 MedianPruner 的 n_startup_trials--------------- 在 TPESampler 的 n_startup_trials 之后开始加载优化算法计算概率空间，之前全是随机超参组合；在 MedianPruner 的 n_startup_trials 之后开始应用剪枝，当此时训练效果比先前 trial 相同的 epoch 性能要低很多时，执行截断，不再训练当前 trial 中剩下的 epoch，转而跳转到新的 trial 继续训练。在 MedianPruner 的 n_startup_trials 之前不管性能如何，全部跑完所有 trial 的 epoch。
 
 然后直接
-
 ```bash
 python tune_param.py
