@@ -1,4 +1,8 @@
-# tune_param.py
+# tune_param_fixed.py
+# 修复要点：
+# - 在写入 storage 前检查 trial 在 storage 中的 state（若已结束则跳过写入 storage）
+# - 在创建/复用 trial 并开始训练前，立即把对应 trial_{N}/params.yaml 的参数写入 trial（优先 storage，再回退到 trial._params）
+# - 在对 trial 调用 study.tell 前，使用 safe_tell() 检查 storage 状态并避免对已 COMPLETE 的 trial 进行 tell（防止 "Cannot tell a COMPLETE trial."）
 
 import optuna
 import subprocess
@@ -36,7 +40,7 @@ seed = 42
 db_path = work_dir / "study.db"
 USED_PARAMS_FILE = work_dir / "used_params.json"
 
-# 全局 study 句柄（在 main 中创建）
+# global study (will be set in main)
 study = None
 
 # ===========================
@@ -71,11 +75,10 @@ METRIC_WEIGHTS = {
     "metrics/recall(B)": 0.15
 }
 
-# 全局映射 fs_trial -> optuna trial number
 FS_TO_OPTUNA = {}
 
 # ===========================
-# 工具函数
+# 工具函数（多数沿用你原来的实现）
 # ===========================
 def safe_unlink(path, max_attempts=5, delay=1):
     if not path.exists():
@@ -188,9 +191,6 @@ def calculate_best_score(trial_dir: Path):
             print(f"Warning: failed to calculate best score: {e}")
     return best_score
 
-# ===========================
-# 构造分布
-# ===========================
 def _make_distribution_for_param(k):
     info = HYPERPARAM_SPACE.get(k)
     if info is None:
@@ -203,87 +203,108 @@ def _make_distribution_for_param(k):
         return None
 
 # ===========================
-# 将 params 强制写入 trial（先检查 storage 中该 trial 是否已结束）
+# 新增辅助：读取 storage 中某个 trial 的 state（若可查）
+# ===========================
+def _get_storage_trial_state(study_obj, trial_number):
+    """
+    返回 storage 中 trial_number 对应的 state（TrialState 枚举），如果无法查到返回 None。
+    """
+    try:
+        storage_trials = study_obj._storage.get_all_trials(study_obj._study_id)
+        for st in storage_trials:
+            try:
+                if getattr(st, "number", None) == trial_number:
+                    return getattr(st, "state", None)
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+# ===========================
+# 安全 tell：在写回 study 前检查 storage 中 trial 状态
+# ===========================
+def safe_tell(study_obj, trial_obj, value, state=None):
+    """
+    在调用 study.tell 前检查 storage 中该 trial 是否已经 COMPLETE/PRUNED/FAIL，
+    如果已结束则跳过 tell（避免 'Cannot tell a COMPLETE trial.' 错误）。
+    """
+    trial_number = getattr(trial_obj, "number", None)
+    try:
+        storage_state = _get_storage_trial_state(study_obj, trial_number)
+        if storage_state in (TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL):
+            # trial 在 storage 中已结束：跳过 tell
+            print(f"safe_tell: storage 中 trial#{trial_number} 已结束（{storage_state}），跳过 tell。")
+            return
+        # 否则正常写回
+        if state is None:
+            study_obj.tell(trial_obj, value)
+        else:
+            study_obj.tell(trial_obj, value, state=state)
+    except Exception as e:
+        # 若出现 "Cannot tell a COMPLETE trial." 之类的异常，打印并继续（不抛出）
+        print(f"safe_tell: 写回 trial#{trial_number} 时出错: {e}")
+
+# ===========================
+# 将 params 强制写入 trial（尽量写入 storage，否则回退到 trial._params）
 # ===========================
 def apply_params_to_trial_storage(trial_obj, params):
     """
-    尝试把 params 写入 storage（使用 dist.to_internal_repr），
-    写入前先检查 storage 中对应 trial 的 state：若已完成则跳过 set_trial_param（RDB 不允许）。
-    任何无法写入的情况都会回退写入 trial_obj._params。
+    优先尝试写入 storage（使用分布的内部表示），写入前检查 storage 中该 trial 是否已结束，
+    已结束就直接把 params 保存在 trial._params（回退），避免 storage 抛错噪声。
     """
     global study
-    # 先写入 trial._params（保证内存中可用）
+    # 先保证 trial_obj._params 更新（内存优先）
     try:
         if hasattr(trial_obj, "_params"):
             trial_obj._params = trial_obj._params or {}
             trial_obj._params.update(params)
         else:
-            setattr(trial_obj, "_params", params)
+            setattr(trial_obj, "_params", params.copy())
     except Exception:
         pass
 
     if study is None:
         return
 
-    # 获取 storage 中所有 trials（用于查找对应 number 的其 state）
-    storage_trials = None
-    try:
-        storage_trials = study._storage.get_all_trials(study._study_id)
-    except Exception:
-        # 如果无法获取则尽量继续，但会在 set_trial_param 上捕获异常
-        storage_trials = None
-
-    # find storage state for this trial.number (if available)
-    storage_state = None
     trial_number = getattr(trial_obj, "number", None)
-    if storage_trials is not None and trial_number is not None:
-        for st in storage_trials:
-            try:
-                if getattr(st, "number", None) == trial_number:
-                    storage_state = getattr(st, "state", None)
-                    break
-            except Exception:
-                continue
+    # 获取 storage 中对应 trial 的 state
+    try:
+        storage_state = _get_storage_trial_state(study, trial_number)
+    except Exception:
+        storage_state = None
 
-    # 如果 storage_state 表示已经结束，则不要调用 set_trial_param（避免 RDB 抛错）
-    finished_states = (TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL)
-    if storage_state in finished_states:
-        # 已结束：只保存在 _params；静默跳过 DB 更新
-        # 仅在调试时打印一次简短提示（不打印每个参数的错误）
+    if storage_state in (TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL):
+        # storage 中该 trial 已结束：不再试图 set_trial_param，直接返回（不过 _params 已写）
         print(f"apply_params_to_trial_storage: storage 中 trial#{trial_number} 已结束，跳过 set_trial_param（使用 params.yaml 作为真相）")
         return
 
-    # 否则尝试逐个写入 storage（使用内部表示），若失败则回退到 _params 并打印原因
     trial_id_for_storage = getattr(trial_obj, "_trial_id", None)
     if trial_id_for_storage is None:
         trial_id_for_storage = trial_number
 
+    # 逐参数写入 storage（转换为内部表示）
     for k, v in params.items():
         dist = _make_distribution_for_param(k)
         if dist is None:
+            # 无法构建 distribution：保留在 _params（已回退）
             continue
-        # 转换外部 -> 内部
         try:
             internal_val = dist.to_internal_repr(v)
         except Exception as e:
-            print(f"apply_params_to_trial_storage: 参数 {k}={v} 转换为内部表示失败: {e}")
-            # 回退（已经在 _params 中）
+            print(f"apply_params_to_trial_storage: 参数 {k}={v} 转内部表示失败: {e}")
             continue
-        # 写入 storage
         try:
             study._storage.set_trial_param(trial_id_for_storage, k, internal_val, dist)
         except Exception as e:
-            # 若错误说明 trial 已结束（不同 storage 表述方式），静默回退，不重复打印大量警告
+            # 若 storage 在写入时变为已结束，静默回退（打印一次信息）
             msg = str(e)
-            if "has already finished" in msg or "can not be updated" in msg:
-                # 说明 race condition 或状态在写入前变为 complete，静默回退
-                # 打印一次调试信息（不逐个参数打印）
-                print(f"apply_params_to_trial_storage: 无法写入参数到 storage（trial#{trial_number}），storage 返回: {msg}. 已回退到 trial._params。")
+            if "has already finished" in msg or "can not be updated" in msg or "finished" in msg:
+                print(f"apply_params_to_trial_storage: 无法通过 storage.set_trial_param 写入 trial#{trial_number} (可能已结束)：{e}。已回退到 trial._params。")
                 return
             else:
-                # 其他异常打印
-                print(f"apply_params_to_trial_storage: 无法通过 storage.set_trial_param 写入参数 {k}，原因: {e}")
-                # 回退：确保 _params 中有该值
+                print(f"apply_params_to_trial_storage: 无法写入参数 {k} 到 storage: {e}")
+                # 回退到 _params（已经写过，但再次确保）
                 try:
                     if hasattr(trial_obj, "_params"):
                         trial_obj._params = trial_obj._params or {}
@@ -294,7 +315,7 @@ def apply_params_to_trial_storage(trial_obj, params):
                     pass
 
 # ===========================
-# 智能同步（只对未完成的 trial 写入 storage）
+# smart sync：把文件系统 params 写回 DB（仅对未完成 trial 尝试写入 storage）
 # ===========================
 def smart_sync_params_from_fs_to_db(study_local):
     existing_trials = study_local.trials
@@ -326,12 +347,13 @@ def smart_sync_params_from_fs_to_db(study_local):
 
         state = getattr(t, "state", None)
         if state in (TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL):
+            # 结束的 trial：只回写到 t._params，跳过 storage 写入
             try:
                 if hasattr(t, "_params"):
                     t._params = t._params or {}
                     t._params.update(params)
                 else:
-                    setattr(t, "_params", params)
+                    setattr(t, "_params", params.copy())
             except Exception:
                 pass
             skipped_finished += 1
@@ -345,28 +367,8 @@ def smart_sync_params_from_fs_to_db(study_local):
 
     print(f"smart_sync_params_from_fs_to_db: 写入 storage {written} 个 trial，跳过 (finished) {skipped_finished} 个")
 
-    empty_count = sum(1 for t in study_local.trials if not getattr(t, "params", None))
-    total = max(1, len(study_local.trials))
-    if empty_count > total // 2:
-        print(f"警告：检测到 {empty_count}/{total} 个 trial 的 params 为空，尝试按 filesystem 重建 DB (clean_invalid_trials).")
-        max_valid = clean_invalid_trials()
-        try:
-            global study
-            storage_url = f"sqlite:///{db_path}"
-            study = optuna.create_study(
-                study_name="yolo_optuna",
-                direction="maximize",
-                storage=storage_url,
-                sampler=TPESampler(seed=seed, n_startup_trials=30),
-                pruner=optuna.pruners.NopPruner(),
-                load_if_exists=True
-            )
-            print("重建 DB 并重新加载 study 完成。")
-        except Exception as e:
-            print(f"重建后重新加载 study 失败: {e}")
-
 # ===========================
-# 按 filesystem 重建 DB（与原逻辑一致，但用内部表示写入）
+# clean_invalid_trials（保留你现有的逻辑，写入时使用内部表示）
 # ===========================
 def clean_invalid_trials():
     existing_trials = get_existing_trial_numbers()
@@ -503,7 +505,7 @@ def clean_invalid_trials():
     return max_valid_trial
 
 # ===========================
-# 参数采样（不变）
+# sample_params / objective / get_last_epoch / signal handler 等（保持逻辑，只在关键点调用 apply_params_to_trial_storage / safe_tell）
 # ===========================
 def sample_params(trial):
     used_params = load_used_params()
@@ -560,9 +562,6 @@ def sample_params(trial):
     save_used_params(used_params)
     return params
 
-# ===========================
-# objective（训练前以 params.yaml 为准并尝试写入 storage）
-# ===========================
 def objective(trial, fs_trial_num=None):
     global study
     fs_num = fs_trial_num if fs_trial_num is not None else trial.number
@@ -589,11 +588,13 @@ def objective(trial, fs_trial_num=None):
                 yaml.dump(params, f)
         except Exception as e:
             print(f"[fs trial {fs_num}] 写 params.yaml 失败: {e}")
+        # 把新采样的 params 立即写入 trial（storage 或 _params）
         try:
             apply_params_to_trial_storage(trial, params)
         except Exception as e:
             print(f"[fs trial {fs_num}] 将新采样参数写入 storage 失败: {e}")
     else:
+        # file 存在时，强制把 params.yaml 内容写回 trial（确保 DB 与 filesystem 保持一致）
         try:
             apply_params_to_trial_storage(trial, params)
         except Exception as e:
@@ -690,9 +691,6 @@ def objective(trial, fs_trial_num=None):
     print(f"[fs trial {fs_num} | optuna trial {optuna_display}] 完成，最优加权得分: {best_score:.4f}")
     return best_score
 
-# ===========================
-# get_last_epoch / signal_handler / main flow (保持原样)
-# ===========================
 def get_last_epoch(trial_dir: Path):
     train_dir = trial_dir / "train"
     if not train_dir.exists():
@@ -720,6 +718,9 @@ def signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 
+# ===========================
+# 主流程（关键处调用 apply_params_to_trial_storage & safe_tell）
+# ===========================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--trials", type=int, default=trials)
@@ -777,11 +778,13 @@ if __name__ == "__main__":
             load_if_exists=True
         )
 
+    # 把 filesystem 的 params 强制同步到 DB（智能版）
     try:
         smart_sync_params_from_fs_to_db(study)
     except Exception as e:
         print(f"smart_sync 出错: {e}")
 
+    # 构造 fs->optuna 映射（读取现有 DB 中的 user_attrs）
     try:
         for t in study.trials:
             try:
@@ -793,7 +796,7 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    # 保持原 resume / new-trials 流程（与你现有脚本一致）
+    # ---- resume specific trials 指定恢复 ----
     if args.resume_trial:
         existing_trials = get_existing_trial_numbers()
         for trial_num in args.resume_trial:
@@ -823,22 +826,37 @@ if __name__ == "__main__":
                     pass
                 print(f"恢复 optuna trial {trial_obj.number} -> 对应文件夹 trial_{trial_num} ...")
 
+            # 在开始 objective 前，确保将 filesystem 的 params 写入该 trial（避免 race）
+            params_path = work_dir / f"trial_{trial_num}" / "params.yaml"
+            if params_path.exists():
+                try:
+                    with open(params_path, "r") as f:
+                        params = yaml.safe_load(f) or {}
+                    if params:
+                        try:
+                            apply_params_to_trial_storage(trial_obj, params)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
             try:
                 val = objective(trial_obj, fs_trial_num=trial_num)
                 try:
-                    study.tell(trial_obj, float(val))
+                    safe_tell(study, trial_obj, float(val))
                 except Exception as e:
                     print(f"tell 写回数据库失败 (resume_trial): {e}")
             except optuna.TrialPruned:
                 trial_dir = work_dir / f"trial_{trial_num}"
                 best = calculate_best_score(trial_dir)
                 try:
-                    study.tell(trial_obj, float(best), state=TrialState.PRUNED)
+                    safe_tell(study, trial_obj, float(best), state=TrialState.PRUNED)
                 except Exception as e:
                     print(f"剪枝状态写回失败: {e}")
             except Exception as e:
                 print(f"恢复 trial {trial_num} 时出错: {e}")
 
+    # ---- resume 所有未完成的 trials ----
     if args.resume:
         incomplete = get_incomplete_trials()
         if incomplete:
@@ -865,21 +883,36 @@ if __name__ == "__main__":
                     pass
                 print(f"恢复 optuna trial {trial_obj.number} -> 对应文件夹 trial_{trial_num} ...")
 
+            # 在开始 objective 前，确保将 filesystem 的 params 写入该 trial（避免 race）
+            params_path = work_dir / f"trial_{trial_num}" / "params.yaml"
+            if params_path.exists():
+                try:
+                    with open(params_path, "r") as f:
+                        params = yaml.safe_load(f) or {}
+                    if params:
+                        try:
+                            apply_params_to_trial_storage(trial_obj, params)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
             try:
                 val = objective(trial_obj, fs_trial_num=trial_num)
                 try:
-                    study.tell(trial_obj, float(val))
+                    safe_tell(study, trial_obj, float(val))
                 except Exception as e:
                     print(f"tell 写回数据库失败 (resume): {e}")
             except optuna.TrialPruned:
                 best = calculate_best_score(work_dir / f"trial_{trial_num}")
                 try:
-                    study.tell(trial_obj, float(best), state=TrialState.PRUNED)
+                    safe_tell(study, trial_obj, float(best), state=TrialState.PRUNED)
                 except Exception as e:
                     print(f"剪枝写回失败: {e}")
             except Exception as e:
                 print(f"恢复 trial {trial_num} 时出错: {e}")
 
+    # ---- 创建新的 trials（补足到指定数量） ----
     existing_trials = get_existing_trial_numbers()
     existing_count = len(existing_trials)
     next_trials_needed = max(0, trials - existing_count)
@@ -898,6 +931,21 @@ if __name__ == "__main__":
             except Exception:
                 pass
             print(f"开始新 fs trial {fs_trial_number} (optuna trial {trial_obj.number}) ...")
+
+            # **关键改动**：在 objective 前，优先把 filesystem 的 params 写入该新 trial（避免新 trial 创建后被其他流程标记 COMPLETE 等 race）
+            params_path = work_dir / f"trial_{fs_trial_number}" / "params.yaml"
+            if params_path.exists():
+                try:
+                    with open(params_path, "r") as f:
+                        params = yaml.safe_load(f) or {}
+                    if params:
+                        try:
+                            apply_params_to_trial_storage(trial_obj, params)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
             try:
                 val = objective(trial_obj, fs_trial_num=fs_trial_number)
                 trial_dir = work_dir / f"trial_{fs_trial_number}"
@@ -906,19 +954,24 @@ if __name__ == "__main__":
                     try:
                         params = yaml.safe_load(open(params_file, "r"))
                         try:
-                            apply_params_to_trial_storage(trial_obj, params)
+                            # 保证 trial._params 也保留一致数据
+                            if hasattr(trial_obj, "_params"):
+                                trial_obj._params = trial_obj._params or {}
+                                trial_obj._params.update(params)
+                            else:
+                                trial_obj._params = params
                         except Exception:
                             pass
                     except Exception:
                         pass
                 try:
-                    study.tell(trial_obj, float(val))
+                    safe_tell(study, trial_obj, float(val))
                 except Exception as e:
                     print(f"tell 写回数据库失败 (new trial): {e}")
             except optuna.TrialPruned:
                 best = calculate_best_score(work_dir / f"trial_{fs_trial_number}")
                 try:
-                    study.tell(trial_obj, float(best), state=TrialState.PRUNED)
+                    safe_tell(study, trial_obj, float(best), state=TrialState.PRUNED)
                 except Exception as e:
                     print(f"剪枝写回失败: {e}")
             except Exception as e:
@@ -926,6 +979,7 @@ if __name__ == "__main__":
 
     print("=== 所有 trials 完成（或已调度） ===")
 
+    # 重新加载 study 并输出最佳 trial（保留原逻辑）
     study = optuna.create_study(
         study_name="yolo_optuna",
         direction="maximize",
