@@ -29,7 +29,7 @@ from optuna.distributions import FloatDistribution, CategoricalDistribution
 # ===========================
 # 配置路径和训练参数
 # ===========================
-data_yaml = "chengdu.yaml"
+data_yaml = ".yaml"
 base_model = "yolo11s.pt"
 trials = 50
 epochs_per_trial = 50
