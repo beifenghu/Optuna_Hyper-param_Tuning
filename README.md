@@ -43,4 +43,8 @@
 
 然后直接
 ```bash
-python tune_param.py
+python tune_param.py --prune  #用于初次启动调优代码，--prune视个人情况开启关闭
+
+python tune_param.py --prune --resume-trial  #对指定的trial id进行断点续训，接着其中被中断的epoch训练，可指定多个trial id，训练完程序即终止
+
+python tune_param.py --prune --resume  #对全局的trial进行断点续训，自动寻找工作空间下未完成的所有trial，断电续训直到全部trial试验完成
