@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-# coding: utf-8
-"""
-Optuna 恢复逻辑改进脚本（A1a：未完成导入为 RUNNING，但一次仅允许导入/继续一个 RUNNING）
- - clean_invalid_trials() 会把确实完成的 fs trial 导入为 COMPLETE；
-   把最多一个未完成的 fs trial 导入为 RUNNING（其余未完成的跳过导入，以避免并行恢复冲突）。
- - resume 时：优先复用 DB 中的 RUNNING trial（OptunaTrial(study, id)），否则 enqueue->ask。
- - 已完成 trial 从文件系统导入时使用 create_trial + add_trial（官方建议的低级 API）。
-注意：请在运行前备份现有 DB 文件（optuna_temp/study.db）。
-"""
-
 import optuna
 import subprocess
 import yaml
@@ -33,7 +22,7 @@ from optuna.distributions import FloatDistribution, CategoricalDistribution
 import optuna.trial as ot_trial
 
 # ===========================
-# 配置路径和训练参数（可根据需要修改）
+# 配置（按需修改）
 # ===========================
 data_yaml = ".yaml"
 base_model = "yolo11s.pt"
@@ -78,11 +67,11 @@ METRIC_WEIGHTS = {
     "metrics/recall(B)": 0.15
 }
 
-# 全局映射 fs_trial -> optuna trial number（会在加载 study 后构建）
+# 全局映射 fs_trial -> optuna trial number（内存缓存）
 FS_TO_OPTUNA = {}
 
 # ===========================
-# 工具函数（基本保持你的实现）
+# 工具函数
 # ===========================
 def safe_unlink(path: Path, max_attempts=5, delay=1):
     if not path.exists():
@@ -96,7 +85,7 @@ def safe_unlink(path: Path, max_attempts=5, delay=1):
                 time.sleep(delay)
                 delay *= 2
             else:
-                print(f"警告：无法删除文件 {path}，可能被其他进程占用")
+                print(f"警告：无法删除文件 {path}, 可能被其他进程占用")
                 return False
         except Exception as e:
             print(f"删除文件 {path} 时出错: {e}")
@@ -141,7 +130,7 @@ def get_existing_trial_numbers():
             try:
                 num = int(item.name.split("_")[1])
                 existing.append(num)
-            except (ValueError, IndexError):
+            except Exception:
                 pass
     return sorted(existing)
 
@@ -168,10 +157,6 @@ def update_trial_status(trial_num, epoch, status="running"):
     save_trial_status(trial_status)
 
 def get_incomplete_trials():
-    """
-    返回文件系统上标记为 running/interrupted 的 fs trial 列表（优先按编号升序）。
-    pruned/completed/failed 会被跳过（不会当作要 resume 的对象）。
-    """
     trial_status = load_trial_status()
     existing = get_existing_trial_numbers()
     nums = [int(trial_num) for trial_num, info in trial_status.items()
@@ -199,9 +184,6 @@ def calculate_best_score(trial_dir: Path):
             print(f"Warning: failed to calculate best score: {e}")
     return best_score
 
-# ===========================
-# 将 HYPERPARAM_SPACE 转为 optuna.distributions dict（用于 create_trial）
-# ===========================
 def build_distributions_from_space():
     d = {}
     for k, v in HYPERPARAM_SPACE.items():
@@ -213,9 +195,6 @@ def build_distributions_from_space():
             d[k] = CategoricalDistribution(v.get("choices", []))
     return d
 
-# ===========================
-# 读写 checkpoint / epoch helper（提前定义以便 clean_invalid_trials 调用）
-# ===========================
 def get_last_epoch(trial_dir: Path):
     train_dir = trial_dir / "train"
     if not train_dir.exists():
@@ -233,9 +212,29 @@ def get_last_epoch(trial_dir: Path):
     return last_epoch, last_ckpt if last_ckpt.exists() else None
 
 # ===========================
-# 从文件系统按顺序重建/替换 Optuna DB（确保 fs_trial -> optuna trial 映射）
-# 使用 create_trial + add_trial 导入已完成试验（官方建议）
-# 改动：已完成->COMPLETE；未完成只选择一个作为 RUNNING 导入，其余跳过导入，避免并行恢复冲突
+# 刷新内存映射（从 DB 中读取 user_attr["fs_trial"]）
+# 在频繁修改 DB 后调用，保证 FS_TO_OPTUNA 与 DB 同步
+# ===========================
+def refresh_fs_to_optuna(study):
+    global FS_TO_OPTUNA
+    FS_TO_OPTUNA = {}
+    try:
+        for t in study.trials:
+            try:
+                fa = t.user_attrs.get("fs_trial", None)
+            except Exception:
+                fa = None
+            if fa is not None:
+                try:
+                    FS_TO_OPTUNA[int(fa)] = t.number
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"refresh_fs_to_optuna 出错: {e}")
+    return FS_TO_OPTUNA
+
+# ===========================
+# 清理 / 重建 DB（仅在 --clean 或 DB 不存在时运行）
 # ===========================
 def clean_invalid_trials():
     existing_trials = get_existing_trial_numbers()
@@ -268,10 +267,8 @@ def clean_invalid_trials():
         return max_valid_trial
 
     distributions = build_distributions_from_space()
-
     imported = 0
-    incomplete_candidates = []  # 保存未完成但有 params 的候选，后续只取一个设为 RUNNING
-    skipped_incomplete = []
+    incomplete_candidates = []
 
     for trial_num in existing_trials:
         trial_dir = work_dir / f"trial_{trial_num}"
@@ -285,7 +282,6 @@ def clean_invalid_trials():
                 print(f"加载 trial_{trial_num} params 失败: {e}")
                 params = {}
 
-        # 计算 last_epoch（可能为0）
         last_epoch, _ = get_last_epoch(trial_dir)
         val = calculate_best_score(trial_dir)
 
@@ -294,7 +290,6 @@ def clean_invalid_trials():
             continue
 
         if last_epoch >= EPOCHS_PER_TRIAL:
-            # 该 fs trial 已完成 —— 导入为 COMPLETE（官方做法）
             try:
                 frozen = ot_trial.create_trial(
                     params=params,
@@ -308,19 +303,17 @@ def clean_invalid_trials():
             except Exception as e:
                 print(f"导入 trial_{trial_num} 到新 DB 时出错: {e}")
         else:
-            # 未完成：收集为候选，后面我们只选择其中一个变成 RUNNING 导入
             incomplete_candidates.append((trial_num, params, int(last_epoch), float(val)))
 
-    # 选择一个未完成的 trial 作为 RUNNING 导入（保证一次仅恢复一个 RUNNING）
+    skipped_incomplete = []
     if incomplete_candidates:
-        # 按编号升序选择第一个（你可以改成其它策略，例如选最大的编号）
         chosen = sorted(incomplete_candidates, key=lambda x: x[0])[0]
         trial_num, params, last_epoch_chosen, val_chosen = chosen
         try:
             frozen = ot_trial.create_trial(
                 params=params,
                 distributions=distributions,
-                value=None,  # 未完成没有 final value
+                value=None,
                 state=TrialState.RUNNING,
                 user_attrs={"fs_trial": int(trial_num), "last_epoch": int(last_epoch_chosen)}
             )
@@ -330,15 +323,13 @@ def clean_invalid_trials():
         except Exception as e:
             print(f"将未完成 trial_{trial_num} 导入为 RUNNING 时出错: {e}")
 
-        # 把其余未完成的 trial 记录下来（不导入 DB，后续 resume 会逐个处理）
         for other in incomplete_candidates:
-            if other[0] == trial_num:
-                continue
-            skipped_incomplete.append(other[0])
+            if other[0] != trial_num:
+                skipped_incomplete.append(other[0])
 
-    print(f"已保留 {imported} 个有效试验（包括最多 1 个 RUNNING）（≤ trial_{max_valid_trial}）")
+    print(f"已保留 {imported} 个有效試驗（包括最多 1 个 RUNNING）（≤ trial_{max_valid_trial}）")
     if skipped_incomplete:
-        print(f"跳过导入 {len(skipped_incomplete)} 个未完成试验（编号示例: {skipped_incomplete[:5]})，它们将在 resume 时按需继续。")
+        print(f"跳过导入 {len(skipped_incomplete)} 个未完成試驗（示例: {skipped_incomplete[:5]}），它们将在 resume 时按需继续。")
 
     try:
         if hasattr(new_storage, "engine") and new_storage.engine is not None:
@@ -347,7 +338,6 @@ def clean_invalid_trials():
         pass
 
     try:
-        # 备份老 db 并替换
         if db_path.exists():
             safe_unlink(db_path)
         if tmp_db.exists():
@@ -389,8 +379,7 @@ def clean_invalid_trials():
     return max_valid_trial
 
 # ===========================
-# 参数采样 - 两阶段策略（优先 Optuna suggest，失败后随机生成 fallback）
-# objective 内部优先使用 params.yaml（resume），否则执行 trial.suggest_*
+# 参数采样（ask 流程）
 # ===========================
 def sample_params_with_trial(trial):
     params = {}
@@ -404,7 +393,7 @@ def sample_params_with_trial(trial):
     return params
 
 # ===========================
-# 目标函数（支持 fs_trial_num）
+# 目标函数（保持 yolo 子进程 / results.csv 逻辑）
 # ===========================
 def objective(trial, fs_trial_num=None):
     fs_num = fs_trial_num if fs_trial_num is not None else trial.number
@@ -414,7 +403,6 @@ def objective(trial, fs_trial_num=None):
 
     params_file = trial_dir / "params.yaml"
 
-    # 优先使用已有 params.yaml（resume）
     if params_file.exists():
         try:
             with open(params_file, 'r') as f:
@@ -422,7 +410,11 @@ def objective(trial, fs_trial_num=None):
         except Exception:
             params = {}
     else:
-        params = sample_params_with_trial(trial)
+        # 如果 trial 对象有已注入的 params（我们在外层可能已注入），优先使用
+        try:
+            params = getattr(trial, "_params", None) or sample_params_with_trial(trial)
+        except Exception:
+            params = sample_params_with_trial(trial)
         try:
             with open(params_file, 'w') as f:
                 yaml.dump(params, f)
@@ -493,7 +485,6 @@ def objective(trial, fs_trial_num=None):
 
                             update_trial_status(fs_num, current_epoch)
 
-                            # 报告给 optuna（供剪枝决策）
                             try:
                                 trial.report(score, current_epoch)
                                 if trial.should_prune():
@@ -502,7 +493,6 @@ def objective(trial, fs_trial_num=None):
                                     process.terminate()
                                     raise optuna.TrialPruned()
                             except Exception:
-                                # 如果无法 report/should_prune（例如不是有效的 Trial 对象），忽略
                                 pass
                     except Exception as e:
                         print(f"读取 results.csv 出错: {e}")
@@ -527,7 +517,7 @@ def objective(trial, fs_trial_num=None):
 # ===========================
 def signal_handler(sig, frame):
     trial_status = load_trial_status()
-    for info in trial_status.values():
+    for k, info in trial_status.items():
         if info["status"] == "running":
             info["status"] = "interrupted"
     save_trial_status(trial_status)
@@ -546,13 +536,22 @@ if __name__ == "__main__":
     parser.add_argument("--prune", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resume-trial", type=int, nargs="*", help="要恢复的trial编号(可多个)")
-    parser.add_argument("--clean", action="store_true", help="清除所有中断状态并重新开始")
+    parser.add_argument("--clean", action="store_true", help="重建并替换 study.db（小心使用）")
     args = parser.parse_args()
 
-    max_valid_trial = clean_invalid_trials()
+    # 只有用户显式要求或 DB 不存在时才进行 clean
+    need_clean = args.clean or (not db_path.exists())
+
+    max_valid_trial = -1
+    if need_clean:
+        max_valid_trial = clean_invalid_trials()
+    else:
+        existing_trials = get_existing_trial_numbers()
+        max_valid_trial = max(existing_trials) if existing_trials else -1
 
     TRIALS_TO_RUN = args.trials
     EPOCHS_PER_TRIAL = args.epochs
+
     sampler = TPESampler(seed=seed, n_startup_trials=30)
     pruner = MedianPruner(n_startup_trials=30) if args.prune else optuna.pruners.NopPruner()
 
@@ -596,15 +595,9 @@ if __name__ == "__main__":
             load_if_exists=True
         )
 
-    # 构造 fs->optuna 映射（读取现有 DB 中的 user_attrs）
+    # 初始构造 fs->optuna 映射（从 DB）
     try:
-        for t in study.trials:
-            try:
-                fa = t.user_attrs.get("fs_trial", None)
-            except Exception:
-                fa = None
-            if fa is not None:
-                FS_TO_OPTUNA[int(fa)] = t.number
+        refresh_fs_to_optuna(study)
     except Exception:
         pass
 
@@ -616,61 +609,48 @@ if __name__ == "__main__":
                 print(f"跳过不存在的試驗: trial_{trial_num}")
                 continue
 
-            # 尝试优先复用 DB 中已有的 optuna trial（且状态允许继续）
             trial_obj = None
-            optuna_id = None
+            # 先刷新映射，确保最新
+            refresh_fs_to_optuna(study)
+
             if trial_num in FS_TO_OPTUNA:
                 optuna_id = FS_TO_OPTUNA[trial_num]
-                # 查找该 trial 在 study.trials 的快照，判断状态
                 mapped = next((t for t in study.trials if t.number == optuna_id), None)
                 if mapped is not None and mapped.state not in (TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL):
-                    # 尝试构造可继续的 Trial 对象
                     try:
                         trial_obj = OptunaTrial(study, optuna_id)
-                        print(f"复用已有的 optuna trial {optuna_id}（继续未完成试验） -> 对应文件夹 trial_{trial_num} ...")
+                        print(f"复用已有的 optuna trial {optuna_id}（继续未完成试驗） -> 对应文件夹 trial_{trial_num} ...")
                     except Exception as e:
                         trial_obj = None
-                        print(f"尝试复用 optuna trial {optuna_id} 失败（将回退到 ask/enqueue）：{e}")
+                        print(f"尝试复用 optuna trial {optuna_id} 失败（回退到 ask）：{e}")
 
-            # 若无法复用已有 trial，则尝试使用 params.yaml enqueue -> ask 流程（官方推荐）
             if trial_obj is None:
+                # 采用 ask() 然后注入 params（若有）
                 params_file = work_dir / f"trial_{trial_num}" / "params.yaml"
+                params = {}
                 if params_file.exists():
                     try:
-                        with open(params_file, "r") as f:
+                        with open(params_file, 'r') as f:
                             params = yaml.safe_load(f) or {}
                     except Exception:
                         params = {}
+
+                # 在马上要运行前 ask（避免提前占位）
+                trial_obj = study.ask()
+                try:
+                    trial_obj.set_user_attr("fs_trial", int(trial_num))
+                    # 立刻更新内存映射以避免重复 ask
+                    FS_TO_OPTUNA[int(trial_num)] = trial_obj.number
                     if params:
                         try:
-                            study.enqueue_trial(params, user_attrs={"fs_trial": int(trial_num)})
-                        except Exception as e:
-                            print(f"enqueue_trial 失败: {e}")
-                        trial_obj = study.ask()
-                        try:
-                            trial_obj.set_user_attr("fs_trial", int(trial_num))
-                            FS_TO_OPTUNA[int(trial_num)] = trial_obj.number
+                            trial_obj._params = params
+                            trial_obj._distributions = build_distributions_from_space()
                         except Exception:
                             pass
-                        print(f"恢复并使用已存在参数: fs trial {trial_num} -> optuna trial {trial_obj.number}")
-                    else:
-                        trial_obj = study.ask()
-                        try:
-                            trial_obj.set_user_attr("fs_trial", int(trial_num))
-                            FS_TO_OPTUNA[int(trial_num)] = trial_obj.number
-                        except Exception:
-                            pass
-                        print(f"恢复 fs trial {trial_num}（params 文件为空/读取失败），将重新采样参数 -> optuna trial {trial_obj.number}")
-                else:
-                    trial_obj = study.ask()
-                    try:
-                        trial_obj.set_user_attr("fs_trial", int(trial_num))
-                        FS_TO_OPTUNA[int(trial_num)] = trial_obj.number
-                    except Exception:
-                        pass
-                    print(f"恢复 fs trial {trial_num}（无 params.yaml），optuna trial {trial_obj.number}（由 sampler 采样）")
+                except Exception:
+                    pass
+                print(f"恢复 fs trial {trial_num} -> optuna trial {trial_obj.number}")
 
-            # 执行并写回
             try:
                 val = objective(trial_obj, fs_trial_num=trial_num)
                 try:
@@ -693,52 +673,45 @@ if __name__ == "__main__":
         incomplete = get_incomplete_trials()
         if incomplete:
             print(f"找到未完成的 trials: {incomplete}")
-        # 顺序逐个 resume（每次只尝试继续一个 RUNNING trial，完成后继续下一个）
+        # 顺序逐个 resume（每次只 ask 一个并运行，完成后继续下一个）
         for trial_num in incomplete:
-            # 优先复用已有映射并且该 optuna trial 状态允许继续
+            # 刷新映射
+            refresh_fs_to_optuna(study)
             trial_obj = None
-            optuna_id = None
             if trial_num in FS_TO_OPTUNA:
                 optuna_id = FS_TO_OPTUNA[trial_num]
                 mapped = next((t for t in study.trials if t.number == optuna_id), None)
                 if mapped is not None and mapped.state not in (TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL):
                     try:
                         trial_obj = OptunaTrial(study, optuna_id)
-                        print(f"复用已有的 optuna trial {optuna_id}（继续未完成试驗） -> 对应文件夹 trial_{trial_num} ...")
+                        print(f"复用已有的 optuna trial {optuna_id}（继续未完成試驗） -> 对应文件夹 trial_{trial_num} ...")
                     except Exception as e:
                         trial_obj = None
-                        print(f"尝试复用 optuna trial {optuna_id} 失败（将回退到 ask/enqueue）：{e}")
+                        print(f"尝试复用 optuna trial {optuna_id} 失败（回退到 ask）：{e}")
 
             if trial_obj is None:
                 params_file = work_dir / f"trial_{trial_num}" / "params.yaml"
+                params = {}
                 if params_file.exists():
                     try:
-                        with open(params_file, "r") as f:
+                        with open(params_file, 'r') as f:
                             params = yaml.safe_load(f) or {}
                     except Exception:
                         params = {}
-                    if params:
-                        try:
-                            study.enqueue_trial(params, user_attrs={"fs_trial": int(trial_num)})
-                        except Exception as e:
-                            print(f"enqueue_trial 失败: {e}")
-                        trial_obj = study.ask()
-                        try:
-                            trial_obj.set_user_attr("fs_trial", int(trial_num))
-                            FS_TO_OPTUNA[int(trial_num)] = trial_obj.number
-                        except Exception:
-                            pass
-                        print(f"恢复并使用已存在参数: fs trial {trial_num} -> optuna trial {trial_obj.number}")
-                    else:
-                        trial_obj = study.ask()
-                        trial_obj.set_user_attr("fs_trial", int(trial_num))
-                        FS_TO_OPTUNA[int(trial_num)] = trial_obj.number
-                        print(f"恢复 fs trial {trial_num}，optuna trial {trial_obj.number}（将重新采样参数）")
-                else:
-                    trial_obj = study.ask()
+
+                trial_obj = study.ask()
+                try:
                     trial_obj.set_user_attr("fs_trial", int(trial_num))
                     FS_TO_OPTUNA[int(trial_num)] = trial_obj.number
-                    print(f"恢复 fs trial {trial_num}（无 params.yaml），optuna trial {trial_obj.number}（由 sampler 采样）")
+                    if params:
+                        try:
+                            trial_obj._params = params
+                            trial_obj._distributions = build_distributions_from_space()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                print(f"恢复 fs trial {trial_num} -> optuna trial {trial_obj.number}")
 
             try:
                 val = objective(trial_obj, fs_trial_num=trial_num)
@@ -756,38 +729,81 @@ if __name__ == "__main__":
                 print(f"恢复 trial {trial_num} 时出错: {e}")
                 traceback.print_exc()
 
+    # 在 resume 完成后刷新映射，确保后续创建新 trial 不重复
+    try:
+        refresh_fs_to_optuna(study)
+    except Exception:
+        pass
+
     # ---- 创建新的 trials（补足到指定数量） ----
     existing_trials = get_existing_trial_numbers()
     existing_count = len(existing_trials)
     next_trials_needed = max(0, TRIALS_TO_RUN - existing_count)
     if next_trials_needed > 0:
         print(f"需要 {next_trials_needed} 个新 trials ...")
-        start_trial_number = (max_valid_trial + 1) if max_valid_trial >= 0 else 0
-        for i in range(next_trials_needed):
-            fs_trial_number = start_trial_number + i
-            if fs_trial_number in get_existing_trial_numbers():
-                print(f"trial_{fs_trial_number} 已存在，跳过...")
-                continue
+        # 依据文件系统现有编号计算起点，避免编号错位
+        start_trial_number = (max(existing_trials) + 1) if existing_trials else 0
+
+        # 我们按需 ask/run 每一个新 trial（避免提前大量 ask 导致占位）
+        created = 0
+        candidate = start_trial_number
+        while created < next_trials_needed:
+            # 找下一个在文件系统上不存在的编号（确保不会覆盖已有目录）
+            existing_fs = set(get_existing_trial_numbers())
+            while candidate in existing_fs:
+                candidate += 1
+
+            fs_trial_number = candidate
+            # 再次刷新FS->optuna，确保不重复创建
+            refresh_fs_to_optuna(study)
+
+            # 重要修正：如果 DB 中已有映射但文件系统上**没有**对应目录，
+            # 我们视为“陈旧映射”并尝试清理，而**不**把 created 增加
+            if fs_trial_number in FS_TO_OPTUNA:
+                mapped_id = FS_TO_OPTUNA[fs_trial_number]
+                fs_dir = work_dir / f"trial_{fs_trial_number}"
+                if fs_dir.exists():
+                    # 真实存在的情况，跳过并计数（已有）
+                    print(f"fs trial {fs_trial_number} 已在 DB 中映射到 optuna trial {mapped_id}，跳过创建。")
+                    created += 1
+                    candidate += 1
+                    continue
+                else:
+                    # 陈旧映射：尝试在 DB 中清理 user_attr("fs_trial")，并从内存映射移除
+                    print(f"警告：发现 DB 中对 fs trial {fs_trial_number} 的映射（optuna trial {mapped_id}），但文件夹不存在，正在移除旧映射。")
+                    try:
+                        t_obj = OptunaTrial(study, mapped_id)
+                        # 将 user_attr 置空（get 会返回 None，refresh 时就不会再映射）
+                        t_obj.set_user_attr("fs_trial", None)
+                    except Exception as e:
+                        print(f"移除旧映射失败: {e}")
+                    FS_TO_OPTUNA.pop(fs_trial_number, None)
+                    # **注意**：这里不改变 created，candidate 保持不变，以便我们在同一 fs_trial_number 上创建新 trial
+                    # 继续下面的创建流程
 
             params_file = work_dir / f"trial_{fs_trial_number}" / "params.yaml"
+            params = {}
             if params_file.exists():
                 try:
                     with open(params_file, "r") as f:
                         params = yaml.safe_load(f) or {}
                 except Exception:
                     params = {}
-                if params:
-                    try:
-                        study.enqueue_trial(params, user_attrs={"fs_trial": int(fs_trial_number)})
-                    except Exception as e:
-                        print(f"enqueue_trial 失败 (new trial): {e}")
 
+            # 真正要运行前再 ask（避免提前占位）
             trial_obj = study.ask()
             try:
                 trial_obj.set_user_attr("fs_trial", int(fs_trial_number))
                 FS_TO_OPTUNA[int(fs_trial_number)] = trial_obj.number
+                if params:
+                    try:
+                        trial_obj._params = params
+                        trial_obj._distributions = build_distributions_from_space()
+                    except Exception:
+                        pass
             except Exception:
                 pass
+
             print(f"开始新 fs trial {fs_trial_number} (optuna trial {trial_obj.number}) ...")
             try:
                 val = objective(trial_obj, fs_trial_num=fs_trial_number)
@@ -805,17 +821,29 @@ if __name__ == "__main__":
                 print(f"运行 trial {fs_trial_number} 时出错: {e}")
                 traceback.print_exc()
 
+            created += 1
+            candidate += 1
+
     print("=== 所有 trials 完成（或已调度） ===")
 
     # 重新 load study（确保最新结果）
-    study = optuna.create_study(
-        study_name="yolo_optuna",
-        direction="maximize",
-        storage=storage_url,
-        sampler=sampler,
-        pruner=pruner,
-        load_if_exists=True
-    )
+    try:
+        study = optuna.create_study(
+            study_name="yolo_optuna",
+            direction="maximize",
+            storage=storage_url,
+            sampler=sampler,
+            pruner=pruner,
+            load_if_exists=True
+        )
+    except Exception:
+        # 在极少数情况下 create_study 可能抛错，忽略
+        pass
+
+    try:
+        refresh_fs_to_optuna(study)
+    except Exception:
+        pass
 
     try:
         if study.best_trial:
