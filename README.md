@@ -46,4 +46,4 @@
 python tune_param.py --prune  #用于初次启动调优代码，--prune视个人情况开启关闭
 python tune_param.py --prune --resume-trial  #对指定的trial id进行断点续训，接着其中被中断的epoch训练，可指定多个trial id，训练完程序即终止
 python tune_param.py --prune --resume  #对全局的trial进行断点续训，自动寻找工作空间下未完成的所有trial，断电续训直到全部trial试验完成
-python tune_param.py --prune --clean  #由于Optuna内部序号自增的缘故，可能会导致对应错位的情况，比如程序执行trial_32，但是实际整体进度才到trial_24，那么首先手动把多余的文件夹删除，然后再执行clean指令就会自动在db中删除多余的trial，接着当前trial_24的下一个试验继续运行
+python tune_param.py --prune --clean  #由于Optuna内部序号自增的缘故，某些试验失败中断可能会导致对应错位+多余trial的情况，比如程序执行trial_32，但是实际整体进度才到trial_24，那么首先手动把多余的文件夹删除，然后再执行clean指令就会自动在db中删除多余的trial，与当前进度一一对应了。后续如需要恢复训练直接加上--resume命令即可
