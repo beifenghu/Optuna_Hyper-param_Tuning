@@ -44,7 +44,6 @@
 然后直接
 ```bash
 python tune_param.py --prune  #用于初次启动调优代码，--prune视个人情况开启关闭
-
 python tune_param.py --prune --resume-trial  #对指定的trial id进行断点续训，接着其中被中断的epoch训练，可指定多个trial id，训练完程序即终止
-
 python tune_param.py --prune --resume  #对全局的trial进行断点续训，自动寻找工作空间下未完成的所有trial，断电续训直到全部trial试验完成
+python tune_param.py --prune --clean  #由于Optuna内部序号自增的缘故，可能会导致对应错位的情况，比如程序执行trial_32，但是实际整体进度才到trial_24,那么这中间trial_25-trial_31就是无效且没有在目录中生成的文件，执行clean代表删除这个多余的trial，从最新的trial_25(trial_24的下一个)开始试验并对应好参数组合和最优的分
