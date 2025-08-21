@@ -1,3 +1,11 @@
+#!/usr/bin/env python3
+# coding: utf-8
+"""
+Optuna 恢复逻辑脚本（改进）
+- 重点修复：训练完成后把结果可靠地写回到 DB 中映射到该 fs_trial 的 optuna trial（及时把 RUNNING -> COMPLETE）
+- 所有写回均通过 finalize_fs_trial(...) 统一处理，包含多次重试与 storage 回退写入与写回后核验
+- 其余逻辑（clean/resume/new trial 等）尽量不变
+"""
 import optuna
 import subprocess
 import yaml
@@ -158,7 +166,6 @@ def update_trial_status(trial_num, epoch, status="running"):
     save_trial_status(trial_status)
 
 def get_incomplete_trials_from_status():
-    """仅从 trial_status.json 获取未完成（running/interrupted）的 fs trial 编号"""
     trial_status = load_trial_status()
     existing = get_existing_trial_numbers()
     nums = [int(trial_num) for trial_num, info in trial_status.items() if info["status"] in ["running", "interrupted"] and int(trial_num) in existing]
@@ -214,7 +221,6 @@ def get_last_epoch(trial_dir: Path):
 
 # ===========================
 # 刷新内存映射（从 DB 中读取 user_attr["fs_trial"]）
-# 在频繁修改 DB 后调用，保证 FS_TO_OPTUNA 与 DB 同步
 # ===========================
 def refresh_fs_to_optuna(study):
     global FS_TO_OPTUNA
@@ -235,13 +241,228 @@ def refresh_fs_to_optuna(study):
     return FS_TO_OPTUNA
 
 # ===========================
-# 清理 / 重建 DB（仅在 --clean 或 DB 不存在时运行）
-# 说明：重建方式 —— 从文件系统导入存在的 trial，避免 orphan 映射
+# safe storage 写入：尽最大努力把 value/state 持久化到 storage
+# - 会尝试使用 storage.get_all_trials(study_id) 来定位内部 id
+# - 然后调用 set_trial_value / set_trial_state 等 API（若存在）
+# - 写入后不忘重载 study 并核验写入结果
+# ===========================
+def safe_storage_write_and_verify(study, fs_num, mapped_number, value, state, tries=3, sleep_between=0.5):
+    """
+    返回 True 表示确认 DB 中对应 trial(value/state) 已被写入并核验。
+    """
+    try:
+        storage = study._storage
+    except Exception as e:
+        print(f"无法获取 study._storage：{e}")
+        return False
+
+    # 尝试定位内部 id（优先通过 storage.get_all_trials）
+    tid = None
+    trial_frozen = None
+    try:
+        if hasattr(storage, "get_all_trials") and hasattr(study, "_study_id"):
+            try:
+                all_trials = storage.get_all_trials(study._study_id)
+                for ft in all_trials:
+                    # Some storage FrozenTrial may have 'number' attr
+                    if getattr(ft, "number", None) == mapped_number:
+                        trial_frozen = ft
+                        tid = getattr(ft, "_trial_id", None) or getattr(ft, "trial_id", None) or getattr(ft, "id", None)
+                        break
+            except Exception:
+                # some storages don't support get_all_trials with study id param
+                try:
+                    all_trials = storage.get_all_trials()
+                    for ft in all_trials:
+                        if getattr(ft, "number", None) == mapped_number:
+                            trial_frozen = ft
+                            tid = getattr(ft, "_trial_id", None) or getattr(ft, "trial_id", None) or getattr(ft, "id", None)
+                            break
+                except Exception:
+                    pass
+        # fallback: if we were given a frozen trial object earlier, try to take id from it
+        if tid is None and trial_frozen is not None:
+            tid = getattr(trial_frozen, "_trial_id", None) or getattr(trial_frozen, "trial_id", None) or getattr(trial_frozen, "id", None)
+    except Exception:
+        pass
+
+    # 如果仍然没 tid，尝试在 study.trials 中找到对应 frozen trial
+    if tid is None:
+        try:
+            for ft in study.trials:
+                if getattr(ft, "number", None) == mapped_number:
+                    trial_frozen = ft
+                    tid = getattr(ft, "_trial_id", None) or getattr(ft, "trial_id", None) or getattr(ft, "id", None)
+                    break
+        except Exception:
+            pass
+
+    if tid is None:
+        print("safe_storage_write: 无法解析内部 trial id，无法用 storage 直接写入")
+        return False
+
+    # 尝试写入（多次重试）
+    for attempt in range(tries):
+        try:
+            if hasattr(storage, "set_trial_value"):
+                try:
+                    storage.set_trial_value(tid, float(value))
+                except Exception as e:
+                    print(f"storage.set_trial_value 失败: {e}")
+            if hasattr(storage, "set_trial_state"):
+                try:
+                    storage.set_trial_state(tid, state)
+                except Exception as e:
+                    print(f"storage.set_trial_state 失败: {e}")
+            # 如果 storage 提供 set_trial_user_attr we could set fs_trial but not necessary
+        except Exception as e:
+            print(f"storage 写入尝试 {attempt} 失败: {e}")
+        # reload study and verify
+        try:
+            study_reloaded = optuna.create_study(study_name=study.study_name, storage=f"sqlite:///{db_path}", load_if_exists=True)
+            refreshed = next((t for t in study_reloaded.trials if t.number == mapped_number), None)
+            if refreshed is not None and refreshed.state in (TrialState.COMPLETE, TrialState.PRUNED) and refreshed.value is not None:
+                # success
+                try:
+                    refresh_fs_to_optuna(study_reloaded)
+                except Exception:
+                    pass
+                print(f"storage 写入并核验成功：optuna#{mapped_number} state={refreshed.state}, value={refreshed.value}")
+                return True
+        except Exception:
+            pass
+        time.sleep(sleep_between)
+    print("safe_storage_write: 多次尝试后仍未能核验写回")
+    return False
+
+# ===========================
+# finalize_fs_trial：统一负责把 fs_trial 的结果写回 DB 并核验
+# - 会多次尝试 study.tell（本地、重载后）；
+# - 若仍失败，则调用 storage 回退写入并核验；
+# - 写回成功后会 reload study 并 refresh_fs_to_optuna，确保内存映射最新。
+# ===========================
+def finalize_fs_trial(study, fs_num, candidate_optuna_number, value, state=TrialState.COMPLETE, max_retries=3):
+    # 强制刷新映射
+    try:
+        refresh_fs_to_optuna(study)
+    except Exception:
+        pass
+
+    mapped_id = FS_TO_OPTUNA.get(fs_num, None)
+    # 额外在 study.trials 里再查一次以防万一
+    if mapped_id is None:
+        for t in study.trials:
+            try:
+                fa = t.user_attrs.get("fs_trial", None)
+            except Exception:
+                fa = None
+            if fa is not None:
+                try:
+                    if int(fa) == int(fs_num):
+                        mapped_id = t.number
+                        FS_TO_OPTUNA[int(fs_num)] = mapped_id
+                        break
+                except Exception:
+                    continue
+
+    # 如果不存在映射，尝试创建（ask -> set_user_attr）
+    if mapped_id is None:
+        print(f"[finalize] DB 中没有映射到 fs_trial {fs_num} 的 optuna trial，尝试新建并写回")
+        try:
+            new_trial = study.ask()
+            try:
+                new_trial.set_user_attr("fs_trial", int(fs_num))
+            except Exception:
+                pass
+            FS_TO_OPTUNA[int(fs_num)] = new_trial.number
+            mapped_id = new_trial.number
+        except Exception as e:
+            print(f"[finalize] ask() 创建新 trial 失败: {e}")
+            mapped_id = candidate_optuna_number
+
+    # 现在 mapped_id 可能为 None 或一个数字 - 以数字为准
+    if mapped_id is None:
+        print(f"[finalize] 无法确定要写回的 optuna trial id (fs_trial {fs_num})")
+        return False
+
+    # 多次尝试写回：优先直接用当前 study 的 OptunaTrial -> study.tell()
+    attempt = 0
+    while attempt < max_retries:
+        attempt += 1
+        try:
+            # 取出最新的 study.trials 中的 frozen，判断状态
+            frozen = next((t for t in study.trials if t.number == mapped_id), None)
+            # 若 frozen 存在并已终态则直接返回成功（可能别处已写回）
+            if frozen is not None and frozen.state in (TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL):
+                print(f"[finalize] optuna#{mapped_id} 已处于终态 ({frozen.state})，跳过写回")
+                # reload & refresh to ensure mapping consistent
+                try:
+                    study = optuna.create_study(study_name=study.study_name, storage=f"sqlite:///{db_path}", load_if_exists=True)
+                    refresh_fs_to_optuna(study)
+                except Exception:
+                    pass
+                return True
+
+            # 使用 OptunaTrial 去写回（优先）
+            try:
+                trial_db = OptunaTrial(study, mapped_id)
+                study.tell(trial_db, float(value), state=state)
+                # reload & verify
+                try:
+                    study_reloaded = optuna.create_study(study_name=study.study_name, storage=f"sqlite:///{db_path}", load_if_exists=True)
+                    refreshed = next((t for t in study_reloaded.trials if t.number == mapped_id), None)
+                    if refreshed is not None and refreshed.state in (TrialState.COMPLETE, TrialState.PRUNED) and refreshed.value is not None:
+                        refresh_fs_to_optuna(study_reloaded)
+                        print(f"[finalize] 成功将 fs_trial {fs_num} 写回到 optuna#{mapped_id}（state={refreshed.state}, value={refreshed.value}）")
+                        return True
+                    else:
+                        print(f"[finalize] 写回后核验未通过 (attempt {attempt})，将重试。")
+                        study = study_reloaded
+                        time.sleep(0.2)
+                        attempt += 0  # continue loop
+                except Exception as e_reload:
+                    print(f"[finalize] 写回后重载 study 以核验失败: {e_reload}")
+                    # fallthrough to next attempt/storage-write
+            except Exception as e_tell:
+                print(f"[finalize] study.tell(optuna#{mapped_id}) 失败 (attempt {attempt}): {e_tell}")
+                # 继续尝试重载 study 并重试
+                try:
+                    study = optuna.create_study(study_name=study.study_name, storage=f"sqlite:///{db_path}", load_if_exists=True)
+                    refresh_fs_to_optuna(study)
+                except Exception as e_r:
+                    print(f"[finalize] 重新加载 study 失败: {e_r}")
+                time.sleep(0.2)
+        except Exception as ex:
+            print(f"[finalize] 写回循环出错: {ex}")
+            time.sleep(0.2)
+
+    # 如果循环完仍未写回，则尝试使用 storage 强制写入并核验
+    print(f"[finalize] study.tell 多次失败或核验未通过，尝试使用 storage 层强制写入 optuna#{mapped_id}")
+    try:
+        study_reloaded = optuna.create_study(study_name=study.study_name, storage=f"sqlite:///{db_path}", load_if_exists=True)
+        ok = safe_storage_write_and_verify(study_reloaded, fs_num, mapped_id, value, state)
+        if ok:
+            try:
+                # reload original study and refresh mapping
+                study_final = optuna.create_study(study_name=study_reloaded.study_name, storage=f"sqlite:///{db_path}", load_if_exists=True)
+                refresh_fs_to_optuna(study_final)
+            except Exception:
+                pass
+            return True
+        else:
+            print(f"[finalize] storage 强制写入也未核验通过 (optuna#{mapped_id})")
+            return False
+    except Exception as e:
+        print(f"[finalize] 在尝试 storage 写入时出错: {e}")
+        return False
+
+# ===========================
+# clean_invalid_trials (保持原来行为)
 # ===========================
 def clean_invalid_trials():
     existing_trials = get_existing_trial_numbers()
     if not existing_trials:
-        print("未发现任何有效试验，从0开始")
+        print("未发现任何有效試驗，从0开始")
         return -1
     max_valid_trial = max(existing_trials)
     print(f"检测到有效试验最大编号: trial_{max_valid_trial}")
@@ -249,7 +470,6 @@ def clean_invalid_trials():
     timestamp = int(time.time())
     tmp_db = work_dir / f"study_rebuilt_{timestamp}.db"
 
-    # 创建新的临时 storage & study，用于向其中导入文件系统上的 trial
     try:
         new_storage = optuna.storages.RDBStorage(
             url=f"sqlite:///{tmp_db}",
@@ -272,7 +492,6 @@ def clean_invalid_trials():
     imported = 0
     incomplete_candidates = []
 
-    # 遍历文件系统上的 trial_*，按编号顺序导入到新 DB
     for trial_num in existing_trials:
         trial_dir = work_dir / f"trial_{trial_num}"
         params_file = trial_dir / "params.yaml"
@@ -284,13 +503,8 @@ def clean_invalid_trials():
             except Exception as e:
                 print(f"加载 trial_{trial_num} params 失败: {e}")
                 params = {}
-        else:
-            params = {}
-
         last_epoch, _ = get_last_epoch(trial_dir)
         val = calculate_best_score(trial_dir)
-
-        # 若 trial 在文件系统上已有完成的 epoch（达到或超过 EPOCHS_PER_TRIAL），导入为 COMPLETE（带 value）
         if last_epoch >= EPOCHS_PER_TRIAL:
             try:
                 frozen = ot_trial.create_trial(
@@ -305,10 +519,8 @@ def clean_invalid_trials():
             except Exception as e:
                 print(f"导入 trial_{trial_num} 到新 DB 时出错: {e}")
         else:
-            # 记录为未完成候选项（我们稍后选一个导入为 RUNNING）
             incomplete_candidates.append((trial_num, params, int(last_epoch), float(val)))
 
-    # 从未完成候选项中选择编号最小的一个导为 RUNNING（优先恢复最早的未完成 fs trial）
     skipped_incomplete = []
     if incomplete_candidates:
         chosen = sorted(incomplete_candidates, key=lambda x: x[0])[0]
@@ -334,21 +546,18 @@ def clean_invalid_trials():
     if skipped_incomplete:
         print(f"跳过导入 {len(skipped_incomplete)} 个未完成試驗（示例: {skipped_incomplete[:5]}），它们将在 resume 时按需继续。")
 
-    # 关闭 new_storage engine（若存在）
     try:
         if hasattr(new_storage, "engine") and new_storage.engine is not None:
             new_storage.engine.dispose()
     except Exception:
         pass
 
-    # 用临时 DB 替换原来的 db（备份原 db）
     try:
         backup = work_dir / f"study.db.bak_{timestamp}"
         if db_path.exists():
             try:
                 db_path.replace(backup)
             except Exception:
-                # fallback to copy & unlink
                 try:
                     shutil.copy2(db_path, backup)
                     safe_unlink(db_path)
@@ -358,14 +567,12 @@ def clean_invalid_trials():
             tmp_db.rename(db_path)
     except Exception as e:
         print(f"替换 study.db 时出错: {e}")
-        # 尝试恢复备份
         try:
             if backup.exists() and not db_path.exists():
                 backup.rename(db_path)
         except Exception:
             pass
 
-    # 同步 used_params（从文件系统读取）
     valid_params = []
     for trial_num in existing_trials:
         trial_dir = work_dir / f"trial_{trial_num}"
@@ -381,7 +588,6 @@ def clean_invalid_trials():
     save_used_params(valid_params)
     print(f"已更新有效参数记录，共 {len(valid_params)} 个有效参数组合")
 
-    # 清理 trial_status 文件，仅保留文件系统上存在的
     if trial_status_file.exists():
         try:
             with open(trial_status_file, 'r') as f:
@@ -413,7 +619,7 @@ def sample_params_with_trial(trial):
     return params
 
 # ===========================
-# 目标函数（保持 yolo 子进程 / results.csv 逻辑）
+# objective：运行训练并返回最终 best_score（不直接写 DB）
 # ===========================
 def objective(trial, fs_trial_num=None):
     fs_num = fs_trial_num if fs_trial_num is not None else trial.number
@@ -428,7 +634,6 @@ def objective(trial, fs_trial_num=None):
         except Exception:
             params = {}
     else:
-        # 如果 trial 对象有已注入的 params（我们在外层可能已注入），优先使用
         try:
             params = getattr(trial, "_params", None) or sample_params_with_trial(trial)
         except Exception:
@@ -537,7 +742,7 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 # ===========================
-# 主流程
+# 主流程（在写回点统一调用 finalize_fs_trial）
 # ===========================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -549,12 +754,11 @@ if __name__ == "__main__":
     parser.add_argument("--clean", action="store_true", help="重建并替换 study.db（小心使用）")
     args = parser.parse_args()
 
-    # 只有用户显式要求或 DB 不存在时才进行 clean
     need_clean = args.clean or (not db_path.exists())
     max_valid_trial = -1
     if need_clean:
         max_valid_trial = clean_invalid_trials()
-        print("DB 清理已完成（重建并只导入文件系统上存在的试验）。根据要求程序将直接退出，后续的 resume/继续运行请使用 --resume 或 --resume-trial 参数。")
+        print("DB 清理已完成（重建并只导入文件系统上存在的试验）。程序将直接退出，后续的 resume/继续运行请使用 --resume 或 --resume-trial 参数。")
         sys.exit(0)
     else:
         existing_trials = get_existing_trial_numbers()
@@ -602,7 +806,6 @@ if __name__ == "__main__":
                 print(f"跳过不存在的試驗: trial_{trial_num}")
                 continue
             trial_obj = None
-            # 先刷新映射，确保最新
             refresh_fs_to_optuna(study)
             if trial_num in FS_TO_OPTUNA:
                 optuna_id = FS_TO_OPTUNA[trial_num]
@@ -615,7 +818,6 @@ if __name__ == "__main__":
                         trial_obj = None
                         print(f"尝试复用 optuna trial {optuna_id} 失败（回退到 ask）：{e}")
             if trial_obj is None:
-                # 采用 ask() 然后注入 params（若有）
                 params_file = work_dir / f"trial_{trial_num}" / "params.yaml"
                 params = {}
                 if params_file.exists():
@@ -624,11 +826,9 @@ if __name__ == "__main__":
                             params = yaml.safe_load(f) or {}
                     except Exception:
                         params = {}
-                # 在马上要运行前 ask（避免提前占位）
                 trial_obj = study.ask()
                 try:
                     trial_obj.set_user_attr("fs_trial", int(trial_num))
-                    # 立刻更新内存映射以避免重复 ask
                     FS_TO_OPTUNA[int(trial_num)] = trial_obj.number
                     if params:
                         try:
@@ -641,36 +841,30 @@ if __name__ == "__main__":
                 print(f"恢复 fs trial {trial_num} -> optuna trial {trial_obj.number}")
             try:
                 val = objective(trial_obj, fs_trial_num=trial_num)
-                try:
-                    study.tell(trial_obj, float(val))
-                except Exception as e:
-                    print(f"tell 写回数据库失败 (resume_trial): {e}")
+                ok = finalize_fs_trial(study, trial_num, getattr(trial_obj, "number", None), float(val), state=TrialState.COMPLETE)
+                if not ok:
+                    print(f"警告：无法将试验结果写回 DB (fs trial {trial_num}).")
             except optuna.TrialPruned:
                 trial_dir = work_dir / f"trial_{trial_num}"
                 best = calculate_best_score(trial_dir)
-                try:
-                    study.tell(trial_obj, float(best), state=TrialState.PRUNED)
-                except Exception as e:
-                    print(f"剪枝状态写回失败: {e}")
+                ok = finalize_fs_trial(study, trial_num, getattr(trial_obj, "number", None), float(best), state=TrialState.PRUNED)
+                if not ok:
+                    print(f"警告：剪枝结果写回失败 (fs trial {trial_num}).")
             except Exception as e:
                 print(f"恢复 trial {trial_num} 时出错: {e}")
                 traceback.print_exc()
-        # 按你的要求：恢复指定 trial 执行完成后程序应立即退出（不继续创建新 trials）
         print("已完成指定 --resume-trial 的恢复任务，程序退出。")
         sys.exit(0)
 
     # ---- resume 所有未完成的 trials ----
     if args.resume:
-        # 优先从 DB 中查找 RUNNING（或非终态）且 user_attr 中有 fs_trial 的试验，并且文件系统对应存在
         incomplete_set = set()
-
         try:
             for t in study.trials:
                 try:
                     fa = t.user_attrs.get("fs_trial", None)
                 except Exception:
                     fa = None
-                # consider trials that are not COMPLETE/PRUNED/FAIL and have fs mapping
                 if fa is not None:
                     try:
                         fs_num = int(fa)
@@ -682,7 +876,6 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"从 DB 查找未完成试验时出错: {e}")
 
-        # 其次合并 trial_status.json 中的记录（仍然保留优先 DB 的结果）
         try:
             status_incomplete = get_incomplete_trials_from_status()
             for n in status_incomplete:
@@ -693,9 +886,7 @@ if __name__ == "__main__":
         incomplete = sorted(list(incomplete_set))
         if incomplete:
             print(f"找到未完成的 trials (优先 DB 映射)：{incomplete}")
-            # 顺序逐个 resume（每次只 ask 一个并运行，完成后继续下一个）
             for trial_num in incomplete:
-                # 刷新映射
                 refresh_fs_to_optuna(study)
                 trial_obj = None
                 if trial_num in FS_TO_OPTUNA:
@@ -732,16 +923,14 @@ if __name__ == "__main__":
                     print(f"恢复 fs trial {trial_num} -> optuna trial {trial_obj.number}")
                 try:
                     val = objective(trial_obj, fs_trial_num=trial_num)
-                    try:
-                        study.tell(trial_obj, float(val))
-                    except Exception as e:
-                        print(f"tell 写回数据库失败 (resume): {e}")
+                    ok = finalize_fs_trial(study, trial_num, getattr(trial_obj, "number", None), float(val), state=TrialState.COMPLETE)
+                    if not ok:
+                        print(f"警告：无法将试验结果写回 DB (fs trial {trial_num}).")
                 except optuna.TrialPruned:
                     best = calculate_best_score(work_dir / f"trial_{trial_num}")
-                    try:
-                        study.tell(trial_obj, float(best), state=TrialState.PRUNED)
-                    except Exception as e:
-                        print(f"剪枝写回失败: {e}")
+                    ok = finalize_fs_trial(study, trial_num, getattr(trial_obj, "number", None), float(best), state=TrialState.PRUNED)
+                    if not ok:
+                        print(f"警告：剪枝写回失败: {trial_num}")
                 except Exception as e:
                     print(f"恢复 trial {trial_num} 时出错: {e}")
                     traceback.print_exc()
@@ -760,32 +949,24 @@ if __name__ == "__main__":
     next_trials_needed = max(0, TRIALS_TO_RUN - existing_count)
     if next_trials_needed > 0:
         print(f"需要 {next_trials_needed} 个新 trials ...")
-        # 依据文件系统现有编号计算起点，避免编号错位
         start_trial_number = (max(existing_trials) + 1) if existing_trials else 0
-        # 我们按需 ask/run 每一个新 trial（避免提前大量 ask 导致占位）
         created = 0
         candidate = start_trial_number
         while created < next_trials_needed:
-            # 找下一个在文件系统上不存在的编号（确保不会覆盖已有目录）
             existing_fs = set(get_existing_trial_numbers())
             while candidate in existing_fs:
                 candidate += 1
             fs_trial_number = candidate
-            # 再次刷新FS->optuna，确保不重复创建
             refresh_fs_to_optuna(study)
-            # 重要修正：如果 DB 中已有映射但文件系统上**没有**对应目录，
-            # 我们视为“陈旧映射”并尝试清理，而**不**把 created 增加
             if fs_trial_number in FS_TO_OPTUNA:
                 mapped_id = FS_TO_OPTUNA[fs_trial_number]
                 fs_dir = work_dir / f"trial_{fs_trial_number}"
                 if fs_dir.exists():
-                    # 真实存在的情况，跳过并计数（已有）
                     print(f"fs trial {fs_trial_number} 已在 DB 中映射到 optuna trial {mapped_id}，跳过创建。")
                     created += 1
                     candidate += 1
                     continue
                 else:
-                    # 陈旧映射：尝试在 DB 中清理 user_attr("fs_trial")，并从内存映射移除
                     print(f"警告：发现 DB 中对 fs trial {fs_trial_number} 的映射（optuna trial {mapped_id}），但文件夹不存在，正在移除旧映射。")
                     try:
                         t_obj = OptunaTrial(study, mapped_id)
@@ -793,7 +974,6 @@ if __name__ == "__main__":
                     except Exception as e:
                         print(f"移除旧映射失败: {e}")
                     FS_TO_OPTUNA.pop(fs_trial_number, None)
-            # **注意**：这里不改变 created，candidate 保持不变，以便我们在同一 fs_trial_number 上创建新 trial
 
             params_file = work_dir / f"trial_{fs_trial_number}" / "params.yaml"
             params = {}
@@ -803,7 +983,6 @@ if __name__ == "__main__":
                         params = yaml.safe_load(f) or {}
                 except Exception:
                     params = {}
-            # 真正要运行前再 ask（避免提前占位）
             trial_obj = study.ask()
             try:
                 trial_obj.set_user_attr("fs_trial", int(fs_trial_number))
@@ -819,16 +998,14 @@ if __name__ == "__main__":
             print(f"开始新 fs trial {fs_trial_number} (optuna trial {trial_obj.number}) ...")
             try:
                 val = objective(trial_obj, fs_trial_num=fs_trial_number)
-                try:
-                    study.tell(trial_obj, float(val))
-                except Exception as e:
-                    print(f"tell 写回数据库失败 (new trial): {e}")
+                ok = finalize_fs_trial(study, fs_trial_number, getattr(trial_obj, "number", None), float(val), state=TrialState.COMPLETE)
+                if not ok:
+                    print(f"警告：无法将新 trial 写回 DB (fs trial {fs_trial_number}).")
             except optuna.TrialPruned:
                 best = calculate_best_score(work_dir / f"trial_{fs_trial_number}")
-                try:
-                    study.tell(trial_obj, float(best), state=TrialState.PRUNED)
-                except Exception as e:
-                    print(f"剪枝写回失败: {e}")
+                ok = finalize_fs_trial(study, fs_trial_number, getattr(trial_obj, "number", None), float(best), state=TrialState.PRUNED)
+                if not ok:
+                    print(f"警告：剪枝写回失败: {fs_trial_number}")
             except Exception as e:
                 print(f"运行 trial {fs_trial_number} 时出错: {e}")
                 traceback.print_exc()
@@ -837,7 +1014,7 @@ if __name__ == "__main__":
 
     print("=== 所有 trials 完成（或已调度） ===")
 
-    # 重新 load study（确保最新结果）
+    # reload study 并打印 best
     try:
         study = optuna.create_study(
             study_name="yolo_optuna",
@@ -848,7 +1025,6 @@ if __name__ == "__main__":
             load_if_exists=True
         )
     except Exception:
-        # 在极少数情况下 create_study 可能抛错，忽略
         pass
     try:
         refresh_fs_to_optuna(study)
