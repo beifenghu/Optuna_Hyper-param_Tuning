@@ -49,8 +49,9 @@
 - METRIC_WEIGHTS------------ 指标权重 (用于得出每个 trial 试验完的最优得分)
 
 - TPESampler 的 n_startup_trials 和 MedianPruner 的 n_startup_trials
-  -- 在 TPESampler 的 n_startup_trials 之后开始加载优化算法计算概率空间，之前全是随机超参组合；
-  -- 在 MedianPruner 的 n_startup_trials 之后开始应用剪枝，当此时训练效果比先前 trial 相同的 epoch 性能要低很多时，执行截断，不再训练当前 trial 中剩下的 epoch，转而跳转到新的 trial 继续训练。在 MedianPruner 的 n_startup_trials 之前不管性能如何，全部跑完所有 trial 的 epoch。
+- 
+- 在 TPESampler 的 n_startup_trials 之后开始加载优化算法计算概率空间，之前全是随机超参组合；
+- 在 MedianPruner 的 n_startup_trials 之后开始应用剪枝，当此时训练效果比先前 trial 相同的 epoch 性能要低很多时，执行截断，不再训练当前 trial 中剩下的 epoch，转而跳转到新的 trial 继续训练。在 MedianPruner 的 n_startup_trials 之前不管性能如何，全部跑完所有 trial 的 epoch。
 
 然后直接
 - python tune_param.py --prune  #用于初次启动调优代码，--prune视个人情况开启关闭
