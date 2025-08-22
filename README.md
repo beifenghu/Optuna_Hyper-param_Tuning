@@ -42,6 +42,16 @@
 - TPESampler 的 n_startup_trials 和 MedianPruner 的 n_startup_trials--------------- 在 TPESampler 的 n_startup_trials 之后开始加载优化算法计算概率空间，之前全是随机超参组合；在 MedianPruner 的 n_startup_trials 之后开始应用剪枝，当此时训练效果比先前 trial 相同的 epoch 性能要低很多时，执行截断，不再训练当前 trial 中剩下的 epoch，转而跳转到新的 trial 继续训练。在 MedianPruner 的 n_startup_trials 之前不管性能如何，全部跑完所有 trial 的 epoch。
 
 然后直接
+- python tune_param.py --prune  #用于初次启动调优代码，--prune视个人情况开启关闭
+- python tune_param.py --prune --resume  #对全局的trial进行断点续训，自动寻找工作空间下未完成的所有trial，断电续训直到全部trial试验完成
+
+## optuna-dashboard参数可视化
+
+终端输入
 ```bash
-python tune_param.py --prune  #用于初次启动调优代码，--prune视个人情况开启关闭
-python tune_param.py --prune --resume  #对全局的trial进行断点续训，自动寻找工作空间下未完成的所有trial，断电续训直到全部trial试验完成
+optuna-dashboard sqlite:///optuna_temp/study.db --host 0.0.0.0 --port 8080
+
+然后在浏览器中打开
+```bash
+http://localhost:8080
+即可查看训练过程及Optuna应用统计学方法得出的参数重要性等一些图表，辅助调优
