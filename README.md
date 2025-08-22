@@ -9,7 +9,7 @@
 
 ---
 
-## 环境创建(不定)
+## 环境设置(不定)
 - 操作系统：Ubuntu 20.04 / Windows 11
 - Python 3.10.18
 - PyTorch 2.x (CUDA 12.6)
