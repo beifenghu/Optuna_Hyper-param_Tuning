@@ -49,10 +49,10 @@
 
 终端输入
 
-optuna-dashboard sqlite:///optuna_temp/study.db --host 0.0.0.0 --port 8080
+- optuna-dashboard sqlite:///optuna_temp/study.db --host 0.0.0.0 --port 8080
 
 然后在浏览器中打开
 
-http://localhost:8080
+- http://localhost:8080
 
 即可查看训练过程及Optuna应用统计学方法得出的参数重要性等一些图表，辅助调优
