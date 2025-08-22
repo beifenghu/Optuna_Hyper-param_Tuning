@@ -43,7 +43,7 @@
 
 然后直接
 - python tune_param.py --prune  #用于初次启动调优代码，--prune视个人情况开启关闭
-- python tune_param.py --prune --resume  #对全局的trial进行断点续训，自动寻找工作空间下未完成的所有trial，断电续训直到全部trial试验完成
+- python tune_param.py --prune --resume  #对中断trial进行寻找并重新训练，直到所有trial全部实验完成
 
 ## optuna-dashboard参数可视化
 
