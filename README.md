@@ -9,7 +9,7 @@
 
 ---
 
-## 环境要求
+## 环境创建(不定)
 - 操作系统：Ubuntu 20.04 / Windows 11
 - Python 3.10.18
 - PyTorch 2.x (CUDA 12.6)
@@ -30,16 +30,27 @@
 
 设置好程序中
 
-- data_yaml----- 你的数据集路径
-- base_model---- 你的模型路径
-- trials------- 寻找参数最优组合试验的次数
-- epochs_per_trial------- 每个试验训练的 epoch 数
-- work_dir-------- 保存的工作路径 (用于保存各个 trial 结果的)
-- seed-------- 随机种子，一般默认
-- db_path-----------Optuna 的过程记录内置文件路径
-- HYPERPARAM_SPACE----------- 超参数搜索空间自定义
-- METRIC_WEIGHTS------------ 指标权重 (用于得出每个 trial 试验完的最优得分)
-- TPESampler 的 n_startup_trials 和 MedianPruner 的 n_startup_trials--------------- 在 TPESampler 的 n_startup_trials 之后开始加载优化算法计算概率空间，之前全是随机超参组合；在 MedianPruner 的 n_startup_trials 之后开始应用剪枝，当此时训练效果比先前 trial 相同的 epoch 性能要低很多时，执行截断，不再训练当前 trial 中剩下的 epoch，转而跳转到新的 trial 继续训练。在 MedianPruner 的 n_startup_trials 之前不管性能如何，全部跑完所有 trial 的 epoch。
+-data_yaml----- 你的数据集路径
+
+-base_model---- 你的模型路径
+
+-TRIALS_TO_RUN------- 进行多少次试验
+
+-EPOCHS_PER_TRIAL------- 每个试验训练的 epoch 数
+
+-work_dir-------- 保存的工作路径 (用于保存各个 trial 结果的)
+
+-seed-------- 随机种子，一般默认
+
+-db_path-----------Optuna 的过程记录内置文件路径
+
+-HYPERPARAM_SPACE----------- 超参数搜索空间自定义
+
+-METRIC_WEIGHTS------------ 指标权重 (用于得出每个 trial 试验完的最优得分)
+
+-TPESampler 的 n_startup_trials 和 MedianPruner 的 n_startup_trials
+  在 TPESampler 的 n_startup_trials 之后开始加载优化算法计算概率空间，之前全是随机超参组合；
+  在 MedianPruner 的 n_startup_trials 之后开始应用剪枝，当此时训练效果比先前 trial 相同的 epoch 性能要低很多时，执行截断，不再训练当前 trial 中剩下的 epoch，转而跳转到新的 trial 继续训练。在 MedianPruner 的 n_startup_trials 之前不管性能如何，全部跑完所有 trial 的 epoch。
 
 然后直接
 - python tune_param.py --prune  #用于初次启动调优代码，--prune视个人情况开启关闭
